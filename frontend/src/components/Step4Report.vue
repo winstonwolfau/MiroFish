@@ -127,14 +127,30 @@
             </div>
           </div>
 
-          <!-- Next Step Button - 在完成后显示 -->
-          <button v-if="isComplete" class="next-step-btn" @click="goToInteraction">
-            <span>{{ $t('step4.goToInteraction') }}</span>
-            <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2">
-              <line x1="5" y1="12" x2="19" y2="12"></line>
-              <polyline points="12 5 19 12 12 19"></polyline>
-            </svg>
-          </button>
+          <!-- Complete Actions -->
+          <div v-if="isComplete" class="complete-actions">
+            <button class="next-step-btn" @click="goToInteraction">
+              <span>{{ $t('step4.goToInteraction') }}</span>
+              <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2">
+                <line x1="5" y1="12" x2="19" y2="12"></line>
+                <polyline points="12 5 19 12 12 19"></polyline>
+              </svg>
+            </button>
+            <button
+              class="export-btn"
+              :disabled="isExportingPdf || isExportingDocx"
+              @click="exportAsPdf"
+            >
+              {{ isExportingPdf ? 'Exporting PDF...' : 'Download PDF' }}
+            </button>
+            <button
+              class="export-btn secondary"
+              :disabled="isExportingPdf || isExportingDocx"
+              @click="exportAsDocx"
+            >
+              {{ isExportingDocx ? 'Exporting DOCX...' : 'Download DOCX' }}
+            </button>
+          </div>
 
           <div class="workflow-divider"></div>
         </div>
@@ -393,6 +409,8 @@
 import { ref, computed, watch, onMounted, onUnmounted, nextTick, h, reactive } from 'vue'
 import { useRouter } from 'vue-router'
 import { useI18n } from 'vue-i18n'
+import html2pdf from 'html2pdf.js'
+import { Document, Packer, Paragraph, HeadingLevel, TextRun } from 'docx'
 import { getAgentLog, getConsoleLog } from '../api/report'
 
 const router = useRouter()
@@ -430,6 +448,8 @@ const leftPanel = ref(null)
 const rightPanel = ref(null)
 const logContent = ref(null)
 const showRawResult = reactive({})
+const isExportingPdf = ref(false)
+const isExportingDocx = ref(false)
 
 // Toggle functions
 const toggleRawResult = (timestamp, event) => {
@@ -1827,9 +1847,276 @@ const workflowSteps = computed(() => {
   return steps
 })
 
+const orderedSectionEntries = computed(() => {
+  const sections = reportOutline.value?.sections || []
+
+  if (sections.length > 0) {
+    return sections.map((section, idx) => ({
+      index: idx + 1,
+      title: section.title || `Section ${idx + 1}`,
+      content: generatedSections.value[idx + 1] || ''
+    }))
+  }
+
+  return Object.keys(generatedSections.value)
+    .map(Number)
+    .sort((a, b) => a - b)
+    .map((idx) => ({
+      index: idx,
+      title: `Section ${idx}`,
+      content: generatedSections.value[idx]
+    }))
+})
+
+const fullReportMarkdown = computed(() => {
+  const lines = []
+  const title = reportOutline.value?.title || `Report ${props.reportId || ''}`.trim()
+
+  lines.push(`# ${title}`)
+  lines.push('')
+
+  const summary = reportOutline.value?.summary
+  if (summary) {
+    lines.push(summary)
+    lines.push('')
+  }
+
+  orderedSectionEntries.value.forEach((entry) => {
+    const content = (entry.content || '').trim()
+    if (!content) return
+
+    if (/^##\s+/m.test(content.split('\n')[0])) {
+      lines.push(content)
+    } else {
+      lines.push(`## ${entry.title}`)
+      lines.push('')
+      lines.push(content)
+    }
+    lines.push('')
+  })
+
+  return lines.join('\n').trim()
+})
+
 // Methods
 const addLog = (msg) => {
   emit('add-log', msg)
+}
+
+const safeFilenameBase = () => {
+  const source = (props.reportId || reportOutline.value?.title || 'report').toString().trim()
+  const normalized = source.replace(/[^a-zA-Z0-9._-]+/g, '_')
+  return normalized || 'report'
+}
+
+const escapeHtml = (value) => {
+  return String(value || '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;')
+}
+
+const markdownInlineToRuns = (text) => {
+  const chunks = String(text || '').split(/(\*\*[^*]+\*\*|`[^`]+`)/g).filter(Boolean)
+  return chunks.map((chunk) => {
+    if (chunk.startsWith('**') && chunk.endsWith('**')) {
+      return new TextRun({ text: chunk.slice(2, -2), bold: true })
+    }
+    if (chunk.startsWith('`') && chunk.endsWith('`')) {
+      return new TextRun({ text: chunk.slice(1, -1), font: 'Courier New' })
+    }
+    return new TextRun(chunk)
+  })
+}
+
+const markdownToDocxParagraphs = (markdown) => {
+  const lines = String(markdown || '').replace(/\r/g, '').split('\n')
+  const paragraphs = []
+
+  lines.forEach((line) => {
+    const raw = line || ''
+    const text = raw.trim()
+
+    if (!text) {
+      paragraphs.push(new Paragraph({ text: '' }))
+      return
+    }
+
+    const headingMatch = text.match(/^(#{1,4})\s+(.+)$/)
+    if (headingMatch) {
+      const levelMap = {
+        1: HeadingLevel.HEADING_1,
+        2: HeadingLevel.HEADING_2,
+        3: HeadingLevel.HEADING_3,
+        4: HeadingLevel.HEADING_4
+      }
+      paragraphs.push(
+        new Paragraph({
+          heading: levelMap[headingMatch[1].length] || HeadingLevel.HEADING_2,
+          children: markdownInlineToRuns(headingMatch[2])
+        })
+      )
+      return
+    }
+
+    const unorderedMatch = text.match(/^[-*]\s+(.+)$/)
+    if (unorderedMatch) {
+      paragraphs.push(
+        new Paragraph({
+          bullet: { level: 0 },
+          children: markdownInlineToRuns(unorderedMatch[1])
+        })
+      )
+      return
+    }
+
+    const orderedMatch = text.match(/^\d+\.\s+(.+)$/)
+    if (orderedMatch) {
+      paragraphs.push(new Paragraph({ children: markdownInlineToRuns(orderedMatch[1]) }))
+      return
+    }
+
+    const quoteMatch = text.match(/^>\s+(.+)$/)
+    if (quoteMatch) {
+      paragraphs.push(
+        new Paragraph({
+          children: [new TextRun({ text: quoteMatch[1], italics: true, color: '6B7280' })]
+        })
+      )
+      return
+    }
+
+    paragraphs.push(new Paragraph({ children: markdownInlineToRuns(text) }))
+  })
+
+  return paragraphs
+}
+
+const downloadBlob = (blob, filename) => {
+  const url = URL.createObjectURL(blob)
+  const anchor = document.createElement('a')
+  anchor.href = url
+  anchor.download = filename
+  document.body.appendChild(anchor)
+  anchor.click()
+  document.body.removeChild(anchor)
+  URL.revokeObjectURL(url)
+}
+
+const exportAsPdf = async () => {
+  if (!fullReportMarkdown.value) return
+
+  isExportingPdf.value = true
+  addLog('Preparing PDF export...')
+
+  const container = document.createElement('div')
+  try {
+    const title = reportOutline.value?.title || `Report ${props.reportId || ''}`.trim()
+    const summary = reportOutline.value?.summary || ''
+    const sectionHtml = orderedSectionEntries.value
+      .filter((entry) => (entry.content || '').trim())
+      .map((entry) => {
+        return `
+          <section class="pdf-section">
+            <h2>${escapeHtml(entry.title)}</h2>
+            <div>${renderMarkdown(entry.content)}</div>
+          </section>
+        `
+      })
+      .join('')
+
+    // Keep the export node attached and paintable. Far off-screen fixed nodes
+    // can produce blank canvases with html2canvas in some browsers.
+    container.style.position = 'absolute'
+    container.style.left = '0'
+    container.style.top = '0'
+    container.style.width = '900px'
+    container.style.opacity = '0'
+    container.style.pointerEvents = 'none'
+    container.style.zIndex = '-1'
+    container.innerHTML = `
+      <div class="pdf-root">
+        <style>
+          .pdf-root { font-family: Arial, sans-serif; color: #1f2937; line-height: 1.7; }
+          .pdf-root h1 { font-size: 30px; margin: 0 0 16px; }
+          .pdf-root .summary { color: #4b5563; margin-bottom: 24px; }
+          .pdf-root h2 { font-size: 22px; margin: 24px 0 10px; border-bottom: 1px solid #e5e7eb; padding-bottom: 8px; }
+          .pdf-root p { margin: 0 0 10px; }
+          .pdf-root blockquote { border-left: 3px solid #d1d5db; margin: 10px 0; padding-left: 10px; color: #6b7280; }
+          .pdf-root ul, .pdf-root ol { margin: 8px 0 8px 20px; }
+          .pdf-root code { background: #f3f4f6; padding: 1px 4px; border-radius: 4px; }
+          .pdf-root pre { background: #f3f4f6; padding: 10px; border-radius: 6px; overflow: hidden; }
+          .pdf-section { page-break-inside: avoid; }
+        </style>
+        <h1>${escapeHtml(title)}</h1>
+        ${summary ? `<p class="summary">${escapeHtml(summary)}</p>` : ''}
+        ${sectionHtml}
+      </div>
+    `
+
+    document.body.appendChild(container)
+    const exportNode = container.querySelector('.pdf-root')
+    if (!exportNode) {
+      throw new Error('Could not prepare PDF content node')
+    }
+
+    // Ensure layout/paint has completed before rasterization.
+    await nextTick()
+    await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)))
+
+    await html2pdf()
+      .from(exportNode)
+      .set({
+        margin: 10,
+        filename: `${safeFilenameBase()}.pdf`,
+        image: { type: 'jpeg', quality: 0.98 },
+        html2canvas: {
+          scale: 2,
+          useCORS: true,
+          logging: false,
+          backgroundColor: '#ffffff'
+        },
+        jsPDF: { unit: 'mm', format: 'a4', orientation: 'portrait' },
+        pagebreak: { mode: ['css', 'legacy'] }
+      })
+      .save()
+
+    addLog('PDF export complete')
+  } catch (err) {
+    console.error('PDF export failed:', err)
+    addLog(`PDF export failed: ${err.message}`)
+  } finally {
+    if (container.parentNode) {
+      container.parentNode.removeChild(container)
+    }
+    isExportingPdf.value = false
+  }
+}
+
+const exportAsDocx = async () => {
+  if (!fullReportMarkdown.value) return
+
+  isExportingDocx.value = true
+  addLog('Preparing DOCX export...')
+
+  try {
+    const sections = [
+      {
+        children: markdownToDocxParagraphs(fullReportMarkdown.value)
+      }
+    ]
+    const doc = new Document({ sections })
+    const blob = await Packer.toBlob(doc)
+    downloadBlob(blob, `${safeFilenameBase()}.docx`)
+    addLog('DOCX export complete')
+  } catch (err) {
+    console.error('DOCX export failed:', err)
+    addLog(`DOCX export failed: ${err.message}`)
+  } finally {
+    isExportingDocx.value = false
+  }
 }
 
 const isSectionCompleted = (sectionIndex) => {
@@ -3402,13 +3689,20 @@ watch(() => props.reportId, (newId) => {
   font-size: 14px;
 }
 
+.complete-actions {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin: 4px 20px 0 20px;
+}
+
 .next-step-btn {
   display: flex;
   align-items: center;
   justify-content: center;
   gap: 8px;
-  width: calc(100% - 40px);
-  margin: 4px 20px 0 20px;
+  width: 100%;
+  margin: 0;
   padding: 14px 20px;
   font-size: 14px;
   font-weight: 600;
@@ -3430,6 +3724,33 @@ watch(() => props.reportId, (newId) => {
 
 .next-step-btn:hover svg {
   transform: translateX(4px);
+}
+
+.export-btn {
+  width: 100%;
+  padding: 12px 16px;
+  border-radius: 8px;
+  border: 1px solid #111827;
+  background: #FFFFFF;
+  color: #111827;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.2s ease;
+}
+
+.export-btn:hover {
+  background: #F9FAFB;
+}
+
+.export-btn.secondary {
+  border-color: #9CA3AF;
+  color: #374151;
+}
+
+.export-btn:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
 }
 
 /* Workflow Empty */

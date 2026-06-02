@@ -23,6 +23,7 @@ class Config:
     # Flask配置
     SECRET_KEY = os.environ.get('SECRET_KEY', 'mirofish-secret-key')
     DEBUG = os.environ.get('FLASK_DEBUG', 'True').lower() == 'true'
+    USE_RELOADER = os.environ.get('FLASK_USE_RELOADER', 'False').lower() == 'true'
     
     # JSON配置 - 禁用ASCII转义，让中文直接显示（而不是 \uXXXX 格式）
     JSON_AS_ASCII = False
@@ -31,9 +32,14 @@ class Config:
     LLM_API_KEY = os.environ.get('LLM_API_KEY')
     LLM_BASE_URL = os.environ.get('LLM_BASE_URL', 'https://api.openai.com/v1')
     LLM_MODEL_NAME = os.environ.get('LLM_MODEL_NAME', 'gpt-4o-mini')
+    LLM_REQUEST_TIMEOUT = float(os.environ.get('LLM_REQUEST_TIMEOUT', '120'))
     
     # Zep配置
     ZEP_API_KEY = os.environ.get('ZEP_API_KEY')
+
+    # 图后端配置（Phase 1: 默认 zep，预留 graphiti）
+    GRAPH_BACKEND = os.environ.get('GRAPH_BACKEND', 'zep').lower()
+    GRAPHITI_SERVICE_URL = os.environ.get('GRAPHITI_SERVICE_URL', 'http://127.0.0.1:8001')
     
     # 文件上传配置
     MAX_CONTENT_LENGTH = 50 * 1024 * 1024  # 50MB
@@ -69,7 +75,9 @@ class Config:
         errors: list[str] = []
         if not cls.LLM_API_KEY:
             errors.append("LLM_API_KEY 未配置")
-        if not cls.ZEP_API_KEY:
+        if cls.GRAPH_BACKEND == 'zep' and not cls.ZEP_API_KEY:
             errors.append("ZEP_API_KEY 未配置")
+        if cls.GRAPH_BACKEND not in {'zep', 'graphiti'}:
+            errors.append("GRAPH_BACKEND 仅支持 zep 或 graphiti")
         return errors
 

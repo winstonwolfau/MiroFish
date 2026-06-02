@@ -225,8 +225,8 @@ class OntologyGenerator:
         
         return result
     
-    # 传给 LLM 的文本最大长度（5万字）
-    MAX_TEXT_LENGTH_FOR_LLM = 50000
+    # 本体设计只需要覆盖主要角色与关系，向本地模型发送过长原文会显著降低稳定性。
+    MAX_TEXT_LENGTH_FOR_LLM = 12000
     
     def _build_user_message(
         self,
@@ -240,10 +240,17 @@ class OntologyGenerator:
         combined_text = "\n\n---\n\n".join(document_texts)
         original_length = len(combined_text)
         
-        # 如果文本超过5万字，截断（仅影响传给LLM的内容，不影响图谱构建）
+        # 如果文本过长，保留首尾片段，兼顾上下文开头与后续补充信息。
         if len(combined_text) > self.MAX_TEXT_LENGTH_FOR_LLM:
-            combined_text = combined_text[:self.MAX_TEXT_LENGTH_FOR_LLM]
-            combined_text += f"\n\n...(原文共{original_length}字，已截取前{self.MAX_TEXT_LENGTH_FOR_LLM}字用于本体分析)..."
+            head_length = int(self.MAX_TEXT_LENGTH_FOR_LLM * 0.7)
+            tail_length = self.MAX_TEXT_LENGTH_FOR_LLM - head_length
+            head_text = combined_text[:head_length]
+            tail_text = combined_text[-tail_length:]
+            combined_text = (
+                f"{head_text}\n\n"
+                f"...(原文共{original_length}字，已截取前{head_length}字与后{tail_length}字用于本体分析)...\n\n"
+                f"{tail_text}"
+            )
         
         message = f"""## 模拟需求
 

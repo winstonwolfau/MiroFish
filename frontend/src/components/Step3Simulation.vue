@@ -365,6 +365,22 @@ const addLog = (msg) => {
   emit('add-log', msg)
 }
 
+const hydrateActions = (serverActions = []) => {
+  allActions.value = []
+  actionIds.value = new Set()
+
+  serverActions.forEach(action => {
+    const actionId = action.id || `${action.timestamp}-${action.platform}-${action.agent_id}-${action.action_type}`
+    if (!actionIds.value.has(actionId)) {
+      actionIds.value.add(actionId)
+      allActions.value.push({
+        ...action,
+        _uniqueId: actionId
+      })
+    }
+  })
+}
+
 // 重置所有状态（用于重新启动模拟）
 const resetAllState = () => {
   phase.value = 0
@@ -377,6 +393,59 @@ const resetAllState = () => {
   isStarting.value = false
   isStopping.value = false
   stopPolling()  // 停止之前可能存在的轮询
+}
+
+const tryRestoreExistingSimulation = async () => {
+  if (!props.simulationId) return false
+
+  try {
+    const statusRes = await getRunStatus(props.simulationId)
+    if (!statusRes.success || !statusRes.data) return false
+
+    const data = statusRes.data
+    const hasExistingRun = Boolean(
+      data.started_at ||
+      data.current_round ||
+      data.total_actions_count ||
+      data.process_pid ||
+      ['running', 'starting', 'stopped', 'completed', 'failed'].includes(data.runner_status)
+    )
+
+    if (!hasExistingRun || data.runner_status === 'idle') {
+      return false
+    }
+
+    resetAllState()
+    runStatus.value = data
+    prevTwitterRound.value = data.twitter_current_round || 0
+    prevRedditRound.value = data.reddit_current_round || 0
+
+    const detailRes = await getRunStatusDetail(props.simulationId)
+    if (detailRes.success && detailRes.data) {
+      hydrateActions(detailRes.data.all_actions || [])
+    }
+
+    if (data.runner_status === 'running' || data.runner_status === 'starting') {
+      phase.value = 1
+      addLog(`Resumed existing simulation session at R${data.current_round || 0}.`)
+      emit('update-status', 'processing')
+      startStatusPolling()
+      startDetailPolling()
+      return true
+    }
+
+    phase.value = 2
+    startError.value = data.error || null
+    addLog(`Restored preserved simulation state at R${data.current_round || 0}.`)
+    if (data.error) {
+      addLog('Previous worker exit details were preserved in the saved run state.')
+    }
+    emit('update-status', data.runner_status === 'failed' ? 'error' : 'completed')
+    return true
+  } catch (err) {
+    console.warn('恢复已有模拟状态失败:', err)
+    return false
+  }
 }
 
 // 启动模拟
@@ -509,6 +578,15 @@ const fetchRunStatus = async () => {
       if (data.reddit_current_round > prevRedditRound.value) {
         addLog(`[Community] R${data.reddit_current_round}/${data.total_rounds} | T:${data.reddit_simulated_hours || 0}h | A:${data.reddit_actions_count}`)
         prevRedditRound.value = data.reddit_current_round
+      }
+
+      if (data.runner_status === 'failed') {
+        startError.value = data.error || 'Simulation worker failed'
+        addLog('Simulation worker stopped unexpectedly. Preserved state remains available for inspection.')
+        phase.value = 2
+        stopPolling()
+        emit('update-status', 'error')
+        return
       }
       
       // 检测模拟是否已完成（通过 runner_status 或平台完成状态判断）
@@ -687,10 +765,13 @@ watch(() => props.systemLogs?.length, () => {
   })
 })
 
-onMounted(() => {
+onMounted(async () => {
   addLog(t('log.step3Init'))
   if (props.simulationId) {
-    doStartSimulation()
+    const restored = await tryRestoreExistingSimulation()
+    if (!restored) {
+      doStartSimulation()
+    }
   }
 })
 

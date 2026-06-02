@@ -8,18 +8,25 @@ const availableLocales = []
 
 for (const path in localeFiles) {
   const key = path.match(/\/([^/]+)\.json$/)[1]
-  if (languages[key]) {
+  if (languages[key] && key !== 'zh') {
     messages[key] = localeFiles[path].default
     availableLocales.push({ key, label: languages[key].label })
   }
 }
 
-const savedLocale = localStorage.getItem('locale') || 'zh'
+const savedLocaleRaw = localStorage.getItem('locale')
+const savedLocale = (savedLocaleRaw && savedLocaleRaw !== 'zh' && messages[savedLocaleRaw])
+  ? savedLocaleRaw
+  : 'en'
+
+if (savedLocaleRaw !== savedLocale) {
+  localStorage.setItem('locale', savedLocale)
+}
 
 const i18n = createI18n({
   legacy: false,
   locale: savedLocale,
-  fallbackLocale: 'zh',
+  fallbackLocale: 'en',
   messages
 })
 

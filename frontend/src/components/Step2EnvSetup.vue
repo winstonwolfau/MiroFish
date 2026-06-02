@@ -530,17 +530,42 @@
 
     <!-- Profile Detail Modal -->
     <Transition name="modal">
-      <div v-if="selectedProfile" class="profile-modal-overlay" @click.self="selectedProfile = null">
+      <div v-if="selectedProfile" class="profile-modal-overlay" @click.self="closeProfileModal">
         <div class="profile-modal">
           <div class="modal-header">
           <div class="modal-header-info">
             <div class="modal-name-row">
-              <span class="modal-realname">{{ selectedProfile.username }}</span>
-              <span class="modal-username">@{{ selectedProfile.name }}</span>
+              <span class="modal-realname">{{ isEditingProfile ? profileDraft.username : selectedProfile.username }}</span>
+              <span class="modal-username">@{{ isEditingProfile ? profileDraft.name : selectedProfile.name }}</span>
             </div>
-            <span class="modal-profession">{{ selectedProfile.profession }}</span>
+            <span v-if="!isEditingProfile" class="modal-profession">{{ selectedProfile.profession }}</span>
+            <input
+              v-else
+              v-model="profileDraft.profession"
+              class="modal-input profession-input"
+              placeholder="Profession"
+            />
           </div>
-          <button class="close-btn" @click="selectedProfile = null">×</button>
+          <div class="modal-header-actions">
+            <button
+              v-if="!isEditingProfile"
+              class="modal-action-btn"
+              @click="beginEditProfile"
+            >Edit</button>
+            <button
+              v-if="isEditingProfile"
+              class="modal-action-btn"
+              :disabled="isSavingProfile"
+              @click="cancelEditProfile"
+            >Cancel</button>
+            <button
+              v-if="isEditingProfile"
+              class="modal-action-btn primary"
+              :disabled="isSavingProfile"
+              @click="saveProfileEdits"
+            >{{ isSavingProfile ? 'Saving...' : 'Save' }}</button>
+            <button class="close-btn" @click="closeProfileModal">×</button>
+          </div>
         </div>
         
         <div class="modal-body">
@@ -548,42 +573,67 @@
           <div class="modal-info-grid">
             <div class="info-item">
               <span class="info-label">{{ $t('step2.profileModalAge') }}</span>
-              <span class="info-value">{{ selectedProfile.age || '-' }} {{ $t('step2.yearsOld') }}</span>
+              <span v-if="!isEditingProfile" class="info-value">{{ selectedProfile.age || '-' }} {{ $t('step2.yearsOld') }}</span>
+              <input v-else v-model="profileDraft.age" class="modal-input" type="number" min="0" placeholder="Age" />
             </div>
             <div class="info-item">
               <span class="info-label">{{ $t('step2.profileModalGender') }}</span>
-              <span class="info-value">{{ { male: $t('step2.genderMale'), female: $t('step2.genderFemale'), other: $t('step2.genderOther') }[selectedProfile.gender] || selectedProfile.gender }}</span>
+              <span v-if="!isEditingProfile" class="info-value">{{ { male: $t('step2.genderMale'), female: $t('step2.genderFemale'), other: $t('step2.genderOther') }[selectedProfile.gender] || selectedProfile.gender }}</span>
+              <select v-else v-model="profileDraft.gender" class="modal-select">
+                <option value="">-</option>
+                <option value="male">male</option>
+                <option value="female">female</option>
+                <option value="other">other</option>
+              </select>
             </div>
             <div class="info-item">
               <span class="info-label">{{ $t('step2.profileModalCountry') }}</span>
-              <span class="info-value">{{ selectedProfile.country || '-' }}</span>
+              <span v-if="!isEditingProfile" class="info-value">{{ selectedProfile.country || '-' }}</span>
+              <input v-else v-model="profileDraft.country" class="modal-input" placeholder="Country" />
             </div>
             <div class="info-item">
               <span class="info-label">{{ $t('step2.profileModalMbti') }}</span>
-              <span class="info-value mbti">{{ selectedProfile.mbti || '-' }}</span>
+              <span v-if="!isEditingProfile" class="info-value mbti">{{ selectedProfile.mbti || '-' }}</span>
+              <input v-else v-model="profileDraft.mbti" class="modal-input" placeholder="MBTI" />
             </div>
           </div>
 
           <!-- 简介 -->
           <div class="modal-section">
             <span class="section-label">{{ $t('step2.profileModalBio') }}</span>
-            <p class="section-bio">{{ selectedProfile.bio || $t('step2.noBio') }}</p>
+            <p v-if="!isEditingProfile" class="section-bio">{{ selectedProfile.bio || $t('step2.noBio') }}</p>
+            <textarea
+              v-else
+              v-model="profileDraft.bio"
+              class="modal-textarea"
+              rows="4"
+              placeholder="Bio"
+            ></textarea>
           </div>
 
           <!-- 关注话题 -->
-          <div class="modal-section" v-if="selectedProfile.interested_topics?.length">
+          <div class="modal-section" v-if="isEditingProfile || selectedProfile.interested_topics?.length">
             <span class="section-label">{{ $t('step2.profileModalTopics') }}</span>
-            <div class="topics-grid">
+            <div v-if="!isEditingProfile" class="topics-grid">
               <span 
                 v-for="topic in selectedProfile.interested_topics" 
                 :key="topic" 
                 class="topic-item"
               >{{ topic }}</span>
             </div>
+            <div v-else>
+              <textarea
+                v-model="profileDraft.interested_topics_text"
+                class="modal-textarea"
+                rows="3"
+                placeholder="Comma-separated topics"
+              ></textarea>
+              <span class="topic-edit-hint">Use commas to separate topics.</span>
+            </div>
           </div>
 
           <!-- 详细人设 -->
-          <div class="modal-section" v-if="selectedProfile.persona">
+          <div class="modal-section" v-if="isEditingProfile || selectedProfile.persona">
             <span class="section-label">{{ $t('step2.profileModalPersona') }}</span>
             
             <!-- 人设维度概览 -->
@@ -607,7 +657,14 @@
             </div>
 
             <div class="persona-content">
-              <p class="section-persona">{{ selectedProfile.persona }}</p>
+              <p v-if="!isEditingProfile" class="section-persona">{{ selectedProfile.persona }}</p>
+              <textarea
+                v-else
+                v-model="profileDraft.persona"
+                class="modal-textarea"
+                rows="10"
+                placeholder="Persona"
+              ></textarea>
             </div>
           </div>
         </div>
@@ -639,7 +696,8 @@ import {
   getPrepareStatus,
   getSimulationProfilesRealtime,
   getSimulationConfig,
-  getSimulationConfigRealtime
+  getSimulationConfigRealtime,
+  updateSimulationProfile
 } from '../api/simulation'
 
 const { t } = useI18n()
@@ -664,6 +722,9 @@ const entityTypes = ref([])
 const expectedTotal = ref(null)
 const simulationConfig = ref(null)
 const selectedProfile = ref(null)
+const isEditingProfile = ref(false)
+const isSavingProfile = ref(false)
+const profileDraft = ref({})
 const showProfilesDetail = ref(true)
 
 // 日志去重：记录上一次输出的关键信息
@@ -766,6 +827,130 @@ const truncateBio = (bio) => {
 
 const selectProfile = (profile) => {
   selectedProfile.value = profile
+  isEditingProfile.value = false
+  profileDraft.value = {
+    name: profile?.name || '',
+    username: profile?.username || '',
+    profession: profile?.profession || '',
+    bio: profile?.bio || '',
+    persona: profile?.persona || '',
+    age: profile?.age ?? '',
+    gender: profile?.gender || '',
+    country: profile?.country || '',
+    mbti: profile?.mbti || '',
+    interested_topics_text: Array.isArray(profile?.interested_topics)
+      ? profile.interested_topics.join(', ')
+      : ''
+  }
+}
+
+const closeProfileModal = () => {
+  selectedProfile.value = null
+  isEditingProfile.value = false
+  isSavingProfile.value = false
+  profileDraft.value = {}
+}
+
+const beginEditProfile = () => {
+  if (!selectedProfile.value) return
+  isEditingProfile.value = true
+}
+
+const cancelEditProfile = () => {
+  if (!selectedProfile.value) {
+    isEditingProfile.value = false
+    return
+  }
+  selectProfile(selectedProfile.value)
+  isEditingProfile.value = false
+}
+
+const saveProfileEdits = async () => {
+  if (!props.simulationId || !selectedProfile.value) {
+    return
+  }
+
+  isSavingProfile.value = true
+  try {
+    const ageValue = profileDraft.value.age === '' || profileDraft.value.age == null
+      ? null
+      : Number(profileDraft.value.age)
+    const topics = (profileDraft.value.interested_topics_text || '')
+      .split(',')
+      .map((s) => s.trim())
+      .filter(Boolean)
+
+    const updates = {
+      name: profileDraft.value.name,
+      username: profileDraft.value.username,
+      profession: profileDraft.value.profession,
+      bio: profileDraft.value.bio,
+      persona: profileDraft.value.persona,
+      age: Number.isNaN(ageValue) ? null : ageValue,
+      gender: profileDraft.value.gender,
+      country: profileDraft.value.country,
+      mbti: profileDraft.value.mbti,
+      interested_topics: topics
+    }
+
+    const hasUserId = selectedProfile.value.user_id !== undefined && selectedProfile.value.user_id !== null
+    const payload = {
+      platform: 'reddit',
+      profile_id: hasUserId ? String(selectedProfile.value.user_id) : String(selectedProfile.value.username || ''),
+      match_by: hasUserId ? 'user_id' : 'username',
+      updates
+    }
+
+    const res = await updateSimulationProfile(props.simulationId, payload)
+    if (!res?.success || !res?.data?.profile) {
+      throw new Error(res?.error || 'Failed to update profile')
+    }
+
+    const updated = res.data.profile
+    const hasUpdatedUserId = updated.user_id !== undefined && updated.user_id !== null
+    const idx = profiles.value.findIndex((p) => {
+      if (hasUpdatedUserId) {
+        return String(p.user_id) === String(updated.user_id)
+      }
+      return String(p.username) === String(updated.username)
+    })
+    if (idx >= 0) {
+      profiles.value[idx] = updated
+    }
+
+    selectedProfile.value = updated
+    isEditingProfile.value = false
+    profileDraft.value = {
+      name: updated?.name || '',
+      username: updated?.username || '',
+      profession: updated?.profession || '',
+      bio: updated?.bio || '',
+      persona: updated?.persona || '',
+      age: updated?.age ?? '',
+      gender: updated?.gender || '',
+      country: updated?.country || '',
+      mbti: updated?.mbti || '',
+      interested_topics_text: Array.isArray(updated?.interested_topics)
+        ? updated.interested_topics.join(', ')
+        : ''
+    }
+
+    addLog('Profile updated successfully.')
+  } catch (err) {
+    const status = err?.response?.status
+    const backendError = err?.response?.data?.error || ''
+    const rawMessage = err?.message || backendError || 'Unknown error'
+    const staleBackend = status === 404 || /not found|method not allowed/i.test(String(rawMessage))
+
+    if (staleBackend) {
+      addLog('Profile update route is unavailable on the current backend process.')
+      addLog('Backend process looks stale. Please restart the backend server and try saving again.')
+    } else {
+      addLog(`Failed to update profile: ${rawMessage}`)
+    }
+  } finally {
+    isSavingProfile.value = false
+  }
 }
 
 // 自动开始准备模拟
@@ -1849,6 +2034,34 @@ onUnmounted(() => {
   flex: 1;
 }
 
+.modal-header-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.modal-action-btn {
+  border: 1px solid #DDD;
+  background: #FFF;
+  color: #333;
+  border-radius: 6px;
+  padding: 6px 12px;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.modal-action-btn.primary {
+  background: #FF5722;
+  border-color: #FF5722;
+  color: #FFF;
+}
+
+.modal-action-btn:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
 .modal-name-row {
   display: flex;
   align-items: baseline;
@@ -1876,6 +2089,11 @@ onUnmounted(() => {
   border-radius: 4px;
   display: inline-block;
   font-weight: 500;
+}
+
+.profession-input {
+  margin-top: 2px;
+  max-width: 320px;
 }
 
 .close-btn {
@@ -1965,6 +2183,37 @@ onUnmounted(() => {
   background: #F9F9F9;
   border-radius: 6px;
   border-left: 3px solid #E0E0E0;
+}
+
+.modal-input,
+.modal-select,
+.modal-textarea {
+  width: 100%;
+  border: 1px solid #D9D9D9;
+  border-radius: 6px;
+  font-size: 13px;
+  color: #333;
+  background: #FFF;
+}
+
+.modal-input,
+.modal-select {
+  height: 34px;
+  padding: 0 10px;
+}
+
+.modal-textarea {
+  min-height: 90px;
+  padding: 10px;
+  resize: vertical;
+  line-height: 1.6;
+}
+
+.topic-edit-hint {
+  display: inline-block;
+  margin-top: 8px;
+  font-size: 11px;
+  color: #777;
 }
 
 /* 话题标签 */

@@ -42,6 +42,15 @@ export const getSimulationProfiles = (simulationId, platform = 'reddit') => {
 }
 
 /**
+ * 更新单个 Agent Profile（用于人工修正实体/人设信息）
+ * @param {string} simulationId
+ * @param {Object} data - { platform?, profile_id, match_by?, updates }
+ */
+export const updateSimulationProfile = (simulationId, data) => {
+  return service.patch(`/api/simulation/${simulationId}/profiles`, data)
+}
+
+/**
  * 实时获取生成中的 Agent Profiles
  * @param {string} simulationId
  * @param {string} platform - 'reddit' | 'twitter'

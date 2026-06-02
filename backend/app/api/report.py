@@ -4,8 +4,11 @@ Report API路由
 """
 
 import os
+import re
 import traceback
 import threading
+from concurrent.futures import ThreadPoolExecutor, Future
+from typing import Dict, Optional
 from flask import request, jsonify, send_file
 
 from . import report_bp
@@ -15,9 +18,41 @@ from ..services.simulation_manager import SimulationManager
 from ..models.project import ProjectManager
 from ..models.task import TaskManager, TaskStatus
 from ..utils.logger import get_logger
-from ..utils.locale import t, get_locale, set_locale
+from ..utils.locale import t, set_locale
 
 logger = get_logger('mirofish.api.report')
+
+
+REPORT_WORKER_EXECUTOR = ThreadPoolExecutor(max_workers=2, thread_name_prefix="report-generate")
+REPORT_WORKER_FUTURES: Dict[str, Future] = {}
+REPORT_WORKER_LOCK = threading.Lock()
+
+
+def _contains_cjk(text: str) -> bool:
+    """Return True if text contains CJK Unified Ideographs."""
+    if not text:
+        return False
+    return bool(re.search(r"[\u4e00-\u9fff]", text))
+
+
+def _register_report_future(task_id: str, future: Future) -> None:
+    with REPORT_WORKER_LOCK:
+        REPORT_WORKER_FUTURES[task_id] = future
+
+
+def _get_report_future(task_id: str) -> Optional[Future]:
+    with REPORT_WORKER_LOCK:
+        return REPORT_WORKER_FUTURES.get(task_id)
+
+
+def _clear_report_future(task_id: str) -> None:
+    with REPORT_WORKER_LOCK:
+        REPORT_WORKER_FUTURES.pop(task_id, None)
+
+
+def _is_local_lm_studio_runtime() -> bool:
+    base_url = (Config.LLM_BASE_URL or "").lower()
+    return ":1234" in base_url and ("127.0.0.1" in base_url or "localhost" in base_url)
 
 
 # ============== 报告生成接口 ==============
@@ -73,16 +108,19 @@ def generate_report():
         if not force_regenerate:
             existing_report = ReportManager.get_report_by_simulation(simulation_id)
             if existing_report and existing_report.status == ReportStatus.COMPLETED:
-                return jsonify({
-                    "success": True,
-                    "data": {
-                        "simulation_id": simulation_id,
-                        "report_id": existing_report.report_id,
-                        "status": "completed",
-                        "message": t('api.reportAlreadyExists'),
-                        "already_generated": True
-                    }
-                })
+                if _contains_cjk(existing_report.markdown_content or ""):
+                    logger.info("Existing report contains CJK characters; regenerating with enforced English output")
+                else:
+                    return jsonify({
+                        "success": True,
+                        "data": {
+                            "simulation_id": simulation_id,
+                            "report_id": existing_report.report_id,
+                            "status": "completed",
+                            "message": t('api.reportAlreadyExists'),
+                            "already_generated": True
+                        }
+                    })
         
         # 获取项目信息
         project = ProjectManager.get_project(state.project_id)
@@ -121,8 +159,8 @@ def generate_report():
             }
         )
         
-        # Capture locale before spawning background thread
-        current_locale = get_locale()
+        # Force English output for report generation regardless of request locale.
+        current_locale = "en"
 
         # 定义后台任务
         def run_generate():
@@ -142,17 +180,9 @@ def generate_report():
                     simulation_requirement=simulation_requirement
                 )
                 
-                # 进度回调
-                def progress_callback(stage, progress, message):
-                    task_manager.update_task(
-                        task_id,
-                        progress=progress,
-                        message=f"[{stage}] {message}"
-                    )
-                
                 # 生成报告（传入预先生成的 report_id）
                 report = agent.generate_report(
-                    progress_callback=progress_callback,
+                    progress_callback=None,
                     report_id=report_id
                 )
                 
@@ -175,9 +205,37 @@ def generate_report():
                 logger.error(f"报告生成失败: {str(e)}")
                 task_manager.fail_task(task_id, str(e))
         
-        # 启动后台线程
-        thread = threading.Thread(target=run_generate, daemon=True)
-        thread.start()
+        force_async = bool(data.get('force_async', False))
+        run_inline = not force_async
+
+        if run_inline:
+            logger.info("Running report generation inline")
+            run_generate()
+            task = task_manager.get_task(task_id)
+            report = ReportManager.get_report(report_id)
+
+            response_status = "failed"
+            if report and report.status == ReportStatus.COMPLETED:
+                response_status = "completed"
+            elif task and task.status == TaskStatus.PROCESSING:
+                response_status = "generating"
+
+            return jsonify({
+                "success": True,
+                "data": {
+                    "simulation_id": simulation_id,
+                    "report_id": report_id,
+                    "task_id": task_id,
+                    "status": response_status,
+                    "message": t('api.reportGenerateStarted'),
+                    "already_generated": False,
+                    "execution_mode": "inline-local"
+                }
+            })
+
+        # 启动后台任务（线程池，避免daemon线程丢失）
+        future = REPORT_WORKER_EXECUTOR.submit(run_generate)
+        _register_report_future(task_id, future)
         
         return jsonify({
             "success": True,
@@ -259,9 +317,61 @@ def get_generate_status():
                 "error": t('api.taskNotFound', id=task_id)
             }), 404
         
+        future = _get_report_future(task_id)
+        if future and future.done():
+            try:
+                future.result()
+            except Exception as worker_error:
+                logger.error(f"报告后台任务异常: {str(worker_error)}")
+                task_manager.fail_task(task_id, str(worker_error))
+            finally:
+                _clear_report_future(task_id)
+            task = task_manager.get_task(task_id)
+
+        report_progress = None
+        report_id = task.metadata.get('report_id') if task and task.metadata else None
+        if report_id:
+            report_progress = ReportManager.get_progress(report_id)
+
+            if task and task.status == TaskStatus.PROCESSING and report_progress:
+                task_manager.update_task(
+                    task_id,
+                    progress=int(report_progress.get('progress', task.progress or 0)),
+                    message=f"[{report_progress.get('status', 'processing')}] {report_progress.get('message', task.message)}",
+                    progress_detail=report_progress,
+                )
+                task = task_manager.get_task(task_id)
+
+            report = ReportManager.get_report(report_id)
+            if report and report.status == ReportStatus.COMPLETED and task and task.status != TaskStatus.COMPLETED:
+                task_manager.complete_task(
+                    task_id,
+                    result={
+                        "report_id": report.report_id,
+                        "simulation_id": report.simulation_id,
+                        "status": "completed",
+                    }
+                )
+                task = task_manager.get_task(task_id)
+                _clear_report_future(task_id)
+            elif report and report.status == ReportStatus.FAILED and task and task.status != TaskStatus.FAILED:
+                task_manager.fail_task(task_id, report.error or t('api.reportGenerateFailed'))
+                task = task_manager.get_task(task_id)
+                _clear_report_future(task_id)
+
+        if not task:
+            return jsonify({
+                "success": False,
+                "error": t('api.taskNotFound', id=task_id)
+            }), 404
+
+        payload = task.to_dict()
+        if report_progress:
+            payload['report_progress'] = report_progress
+
         return jsonify({
             "success": True,
-            "data": task.to_dict()
+            "data": payload
         })
         
     except Exception as e:

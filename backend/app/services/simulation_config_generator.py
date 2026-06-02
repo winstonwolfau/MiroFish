@@ -19,6 +19,7 @@ from datetime import datetime
 from openai import OpenAI
 
 from ..config import Config
+from ..utils.llm_client import parse_json_content, request_json_completion
 from ..utils.logger import get_logger
 from ..utils.locale import get_language_instruction, t
 from .zep_entity_reader import EntityNode, ZepEntityReader
@@ -210,17 +211,30 @@ class SimulationConfigGenerator:
     3. 生成平台配置
     """
     
-    # 上下文最大字符数
-    MAX_CONTEXT_LENGTH = 50000
+    # 本地模型对超长上下文更容易空响应，使用受控采样窗口提升稳定性。
+    MAX_CONTEXT_LENGTH = 12000
     # 每批生成的Agent数量
-    AGENTS_PER_BATCH = 15
+    AGENTS_PER_BATCH = 10
     
     # 各步骤的上下文截断长度（字符数）
-    TIME_CONFIG_CONTEXT_LENGTH = 10000   # 时间配置
-    EVENT_CONFIG_CONTEXT_LENGTH = 8000   # 事件配置
-    ENTITY_SUMMARY_LENGTH = 300          # 实体摘要
-    AGENT_SUMMARY_LENGTH = 300           # Agent配置中的实体摘要
-    ENTITIES_PER_TYPE_DISPLAY = 20       # 每类实体显示数量
+    TIME_CONFIG_CONTEXT_LENGTH = 6000    # 时间配置
+    EVENT_CONFIG_CONTEXT_LENGTH = 6000   # 事件配置
+    ENTITY_SUMMARY_LENGTH = 220          # 实体摘要
+    AGENT_SUMMARY_LENGTH = 180           # Agent配置中的实体摘要
+    ENTITIES_PER_TYPE_DISPLAY = 12       # 每类实体显示数量
+
+    def _sample_text(self, text: str, max_length: int) -> str:
+        """对长文本做首尾采样，避免只保留文档开头。"""
+        if not text or len(text) <= max_length:
+            return text
+
+        head_length = int(max_length * 0.7)
+        tail_length = max_length - head_length
+        return (
+            f"{text[:head_length]}\n\n"
+            f"...(内容已截断，保留前{head_length}字与后{tail_length}字)...\n\n"
+            f"{text[-tail_length:]}"
+        )
     
     def __init__(
         self,
@@ -399,9 +413,7 @@ class SimulationConfigGenerator:
         remaining_length = self.MAX_CONTEXT_LENGTH - current_length - 500  # 留500字符余量
         
         if remaining_length > 0 and document_text:
-            doc_text = document_text[:remaining_length]
-            if len(document_text) > remaining_length:
-                doc_text += "\n...(文档已截断)"
+            doc_text = self._sample_text(document_text, remaining_length)
             context_parts.append(f"\n## 原始文档内容\n{doc_text}")
         
         return "\n".join(context_parts)
@@ -440,19 +452,17 @@ class SimulationConfigGenerator:
         
         for attempt in range(max_attempts):
             try:
-                response = self.client.chat.completions.create(
+                content, finish_reason = request_json_completion(
+                    client=self.client,
                     model=self.model_name,
                     messages=[
                         {"role": "system", "content": system_prompt},
                         {"role": "user", "content": prompt}
                     ],
-                    response_format={"type": "json_object"},
-                    temperature=0.7 - (attempt * 0.1)  # 每次重试降低温度
-                    # 不设置max_tokens，让LLM自由发挥
+                    temperature=0.7 - (attempt * 0.1),  # 每次重试降低温度
+                    max_tokens=None,
+                    base_url=self.base_url,
                 )
-                
-                content = response.choices[0].message.content
-                finish_reason = response.choices[0].finish_reason
                 
                 # 检查是否被截断
                 if finish_reason == 'length':
@@ -461,8 +471,8 @@ class SimulationConfigGenerator:
                 
                 # 尝试解析JSON
                 try:
-                    return json.loads(content)
-                except json.JSONDecodeError as e:
+                    return parse_json_content(content)
+                except (json.JSONDecodeError, ValueError) as e:
                     logger.warning(f"JSON解析失败 (attempt {attempt+1}): {str(e)[:80]}")
                     
                     # 尝试修复JSON
@@ -535,7 +545,7 @@ class SimulationConfigGenerator:
     def _generate_time_config(self, context: str, num_entities: int) -> Dict[str, Any]:
         """生成时间配置"""
         # 使用配置的上下文截断长度
-        context_truncated = context[:self.TIME_CONFIG_CONTEXT_LENGTH]
+        context_truncated = self._sample_text(context, self.TIME_CONFIG_CONTEXT_LENGTH)
         
         # 计算最大允许值（80%的agent数）
         max_agents_allowed = max(1, int(num_entities * 0.9))
@@ -671,7 +681,7 @@ class SimulationConfigGenerator:
         ])
         
         # 使用配置的上下文截断长度
-        context_truncated = context[:self.EVENT_CONFIG_CONTEXT_LENGTH]
+        context_truncated = self._sample_text(context, self.EVENT_CONFIG_CONTEXT_LENGTH)
         
         prompt = f"""基于以下模拟需求，生成事件配置。
 

@@ -19,6 +19,7 @@ from openai import OpenAI
 from zep_cloud.client import Zep
 
 from ..config import Config
+from ..utils.llm_client import parse_json_content, request_json_completion
 from ..utils.logger import get_logger
 from ..utils.locale import get_language_instruction, get_locale, set_locale, t
 from .zep_entity_reader import EntityNode, ZepEntityReader
@@ -177,6 +178,11 @@ class OasisProfileGenerator:
         "university", "governmentagency", "organization", "ngo", 
         "mediaoutlet", "company", "institution", "group", "community"
     ]
+
+    MAX_PROMPT_CONTEXT_CHARS = 1800
+    MAX_SUMMARY_CHARS = 400
+    MAX_ATTRIBUTES_CHARS = 800
+    TARGET_PERSONA_CHARS = 1000
     
     def __init__(
         self, 
@@ -282,6 +288,19 @@ class OasisProfileGenerator:
         # 添加随机后缀避免重复
         suffix = random.randint(100, 999)
         return f"{username}_{suffix}"
+
+    def _sample_text(self, text: str, max_length: int) -> str:
+        """对长文本做首尾采样，兼顾背景与近期信息。"""
+        if not text or len(text) <= max_length:
+            return text
+
+        head_length = int(max_length * 0.7)
+        tail_length = max_length - head_length
+        return (
+            f"{text[:head_length]}\n\n"
+            f"...(内容已截断，保留前{head_length}字与后{tail_length}字)...\n\n"
+            f"{text[-tail_length:]}"
+        )
     
     def _search_zep_for_entity(self, entity: EntityNode) -> Dict[str, Any]:
         """
@@ -527,28 +546,26 @@ class OasisProfileGenerator:
         
         for attempt in range(max_attempts):
             try:
-                response = self.client.chat.completions.create(
+                content, finish_reason = request_json_completion(
+                    client=self.client,
                     model=self.model_name,
                     messages=[
                         {"role": "system", "content": self._get_system_prompt(is_individual)},
                         {"role": "user", "content": prompt}
                     ],
-                    response_format={"type": "json_object"},
-                    temperature=0.7 - (attempt * 0.1)  # 每次重试降低温度
-                    # 不设置max_tokens，让LLM自由发挥
+                    temperature=0.7 - (attempt * 0.1),  # 每次重试降低温度
+                    max_tokens=2048,
+                    base_url=self.base_url,
                 )
-                
-                content = response.choices[0].message.content
-                
+
                 # 检查是否被截断（finish_reason不是'stop'）
-                finish_reason = response.choices[0].finish_reason
                 if finish_reason == 'length':
                     logger.warning(f"LLM输出被截断 (attempt {attempt+1}), 尝试修复...")
                     content = self._fix_truncated_json(content)
                 
                 # 尝试解析JSON
                 try:
-                    result = json.loads(content)
+                    result = parse_json_content(content)
                     
                     # 验证必需字段
                     if "bio" not in result or not result["bio"]:
@@ -684,14 +701,16 @@ class OasisProfileGenerator:
     ) -> str:
         """构建个人实体的详细人设提示词"""
         
-        attrs_str = json.dumps(entity_attributes, ensure_ascii=False) if entity_attributes else "无"
-        context_str = context[:3000] if context else "无额外上下文"
+        attrs_json = json.dumps(entity_attributes, ensure_ascii=False) if entity_attributes else "无"
+        attrs_str = self._sample_text(attrs_json, self.MAX_ATTRIBUTES_CHARS)
+        summary_str = self._sample_text(entity_summary or "", self.MAX_SUMMARY_CHARS)
+        context_str = self._sample_text(context or "无额外上下文", self.MAX_PROMPT_CONTEXT_CHARS)
         
         return f"""为实体生成详细的社交媒体用户人设,最大程度还原已有现实情况。
 
 实体名称: {entity_name}
 实体类型: {entity_type}
-实体摘要: {entity_summary}
+实体摘要: {summary_str}
 实体属性: {attrs_str}
 
 上下文信息:
@@ -699,8 +718,8 @@ class OasisProfileGenerator:
 
 请生成JSON，包含以下字段:
 
-1. bio: 社交媒体简介，200字
-2. persona: 详细人设描述（2000字的纯文本），需包含:
+1. bio: 社交媒体简介，控制在120字内
+2. persona: 详细人设描述（约{self.TARGET_PERSONA_CHARS}字的纯文本），需包含:
    - 基本信息（年龄、职业、教育背景、所在地）
    - 人物背景（重要经历、与事件的关联、社会关系）
    - 性格特征（MBTI类型、核心性格、情绪表达方式）
@@ -733,14 +752,16 @@ class OasisProfileGenerator:
     ) -> str:
         """构建群体/机构实体的详细人设提示词"""
         
-        attrs_str = json.dumps(entity_attributes, ensure_ascii=False) if entity_attributes else "无"
-        context_str = context[:3000] if context else "无额外上下文"
+        attrs_json = json.dumps(entity_attributes, ensure_ascii=False) if entity_attributes else "无"
+        attrs_str = self._sample_text(attrs_json, self.MAX_ATTRIBUTES_CHARS)
+        summary_str = self._sample_text(entity_summary or "", self.MAX_SUMMARY_CHARS)
+        context_str = self._sample_text(context or "无额外上下文", self.MAX_PROMPT_CONTEXT_CHARS)
         
         return f"""为机构/群体实体生成详细的社交媒体账号设定,最大程度还原已有现实情况。
 
 实体名称: {entity_name}
 实体类型: {entity_type}
-实体摘要: {entity_summary}
+实体摘要: {summary_str}
 实体属性: {attrs_str}
 
 上下文信息:
@@ -748,8 +769,8 @@ class OasisProfileGenerator:
 
 请生成JSON，包含以下字段:
 
-1. bio: 官方账号简介，200字，专业得体
-2. persona: 详细账号设定描述（2000字的纯文本），需包含:
+1. bio: 官方账号简介，控制在120字内，专业得体
+2. persona: 详细账号设定描述（约{self.TARGET_PERSONA_CHARS}字的纯文本），需包含:
    - 机构基本信息（正式名称、机构性质、成立背景、主要职能）
    - 账号定位（账号类型、目标受众、核心功能）
    - 发言风格（语言特点、常用表达、禁忌话题）

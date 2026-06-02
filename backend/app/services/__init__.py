@@ -36,6 +36,7 @@ from .simulation_ipc import (
     CommandType,
     CommandStatus
 )
+from .graph_entity_reader import get_entity_reader
 
 __all__ = [
     'OntologyGenerator', 
@@ -69,5 +70,6 @@ __all__ = [
     'IPCResponse',
     'CommandType',
     'CommandStatus',
+    'get_entity_reader',
 ]
 

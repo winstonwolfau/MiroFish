@@ -40,9 +40,10 @@ def main():
     host = os.environ.get('FLASK_HOST', '0.0.0.0')
     port = int(os.environ.get('FLASK_PORT', 5001))
     debug = Config.DEBUG
+    use_reloader = Config.USE_RELOADER
     
     # 启动服务
-    app.run(host=host, port=port, debug=debug, threaded=True)
+    app.run(host=host, port=port, debug=debug, use_reloader=use_reloader, threaded=True)
 
 
 if __name__ == '__main__':

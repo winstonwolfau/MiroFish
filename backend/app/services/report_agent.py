@@ -19,9 +19,9 @@ from datetime import datetime
 from enum import Enum
 
 from ..config import Config
-from ..utils.llm_client import LLMClient
+from ..utils.llm_client import LLMClient, parse_json_content, request_json_completion
 from ..utils.logger import get_logger
-from ..utils.locale import get_language_instruction, t
+from ..utils.locale import t
 from .zep_tools import (
     ZepToolsService, 
     SearchResult, 
@@ -29,8 +29,12 @@ from .zep_tools import (
     PanoramaResult,
     InterviewResult
 )
+from .simulation_runner import SimulationRunner
 
 logger = get_logger('mirofish.report_agent')
+
+
+FORCED_REPORT_LANGUAGE_INSTRUCTION = "Please respond in English."
 
 
 class ReportLogger:
@@ -712,7 +716,7 @@ SECTION_SYSTEM_PROMPT_TEMPLATE = """\
 - insight_forge: 深度洞察分析，自动分解问题并多维度检索事实和关系
 - panorama_search: 广角全景搜索，了解事件全貌、时间线和演变过程
 - quick_search: 快速验证某个具体信息点
-- interview_agents: 采访模拟Agent，获取不同角色的第一人称观点和真实反应
+- 只有在工具列表中明确列出 interview_agents 时，才可以使用它
 
 ═══════════════════════════════════════════════════════════════
 【工作流程】
@@ -880,6 +884,11 @@ class ReportAgent:
     
     # 对话中的最大工具调用次数
     MAX_TOOL_CALLS_PER_CHAT = 2
+
+    # 章节生成对本地模型压力较大，适当降低输出预算并允许轻量重试。
+    SECTION_LLM_MAX_TOKENS = 2048
+    SECTION_LLM_MAX_RETRIES = 3
+    SECTION_OBSERVATION_MAX_CHARS = 12000
     
     def __init__(
         self, 
@@ -905,6 +914,7 @@ class ReportAgent:
         
         self.llm = llm_client or LLMClient()
         self.zep_tools = zep_tools or ZepToolsService()
+        self.interview_tool_available = self._check_interview_tool_available()
         
         # 工具定义
         self.tools = self._define_tools()
@@ -913,12 +923,29 @@ class ReportAgent:
         self.report_logger: Optional[ReportLogger] = None
         # 控制台日志记录器（在 generate_report 中初始化）
         self.console_logger: Optional[ReportConsoleLogger] = None
+
+        if not self.interview_tool_available:
+            logger.info(
+                "Interview tool disabled for report generation because the simulation environment is not running: %s",
+                simulation_id,
+            )
         
         logger.info(t('report.agentInitDone', graphId=graph_id, simulationId=simulation_id))
+
+    def _check_interview_tool_available(self) -> bool:
+        try:
+            return SimulationRunner.check_env_alive(self.simulation_id)
+        except Exception as error:
+            logger.warning(
+                "Failed to inspect interview tool availability for simulation %s: %s",
+                self.simulation_id,
+                str(error),
+            )
+            return False
     
     def _define_tools(self) -> Dict[str, Dict[str, Any]]:
         """定义可用工具"""
-        return {
+        tools = {
             "insight_forge": {
                 "name": "insight_forge",
                 "description": TOOL_DESC_INSIGHT_FORGE,
@@ -942,8 +969,11 @@ class ReportAgent:
                     "query": "搜索查询字符串",
                     "limit": "返回结果数量（可选，默认10）"
                 }
-            },
-            "interview_agents": {
+            }
+        }
+
+        if self.interview_tool_available:
+            tools["interview_agents"] = {
                 "name": "interview_agents",
                 "description": TOOL_DESC_INTERVIEW_AGENTS,
                 "parameters": {
@@ -951,7 +981,502 @@ class ReportAgent:
                     "max_agents": "最多采访的Agent数量（可选，默认5，最大10）"
                 }
             }
-        }
+
+        return tools
+
+    def _request_section_llm(
+        self,
+        *,
+        messages: List[Dict[str, str]],
+        temperature: float,
+        section_title: str,
+        iteration_label: str,
+        max_tokens: Optional[int] = None,
+    ) -> str:
+        """为章节生成包装轻量重试，降低单次本地模型失败的影响。"""
+        last_error = None
+        token_budget = max_tokens or self.SECTION_LLM_MAX_TOKENS
+        max_retries = 2 if self._is_local_lm_studio() else self.SECTION_LLM_MAX_RETRIES
+
+        if self._is_local_lm_studio():
+            if iteration_label == "forced-final":
+                token_budget = min(token_budget, 1024)
+            else:
+                token_budget = min(token_budget, 768)
+
+        for attempt in range(max_retries):
+            if self._is_local_lm_studio():
+                attempt_tokens = max(384, token_budget - (attempt * 256))
+            else:
+                attempt_tokens = max(1024, token_budget - (attempt * 512))
+            attempt_temperature = max(0.2, temperature - (attempt * 0.1))
+
+            try:
+                logger.info(
+                    "Section LLM request start: section='%s', %s, attempt=%s/%s, max_tokens=%s",
+                    section_title,
+                    iteration_label,
+                    attempt + 1,
+                    max_retries,
+                    attempt_tokens,
+                )
+                request_started_at = time.time()
+                response = self.llm.chat(
+                    messages=messages,
+                    temperature=attempt_temperature,
+                    max_tokens=attempt_tokens
+                )
+                logger.info(
+                    "Section LLM request complete: section='%s', %s, attempt=%s/%s, elapsed=%.2fs",
+                    section_title,
+                    iteration_label,
+                    attempt + 1,
+                    max_retries,
+                    time.time() - request_started_at,
+                )
+                return response
+            except Exception as error:
+                last_error = error
+                logger.warning(
+                    "Section LLM call failed for '%s' (%s, attempt %s/%s): %s",
+                    section_title,
+                    iteration_label,
+                    attempt + 1,
+                    max_retries,
+                    str(error),
+                )
+                if attempt == max_retries - 1:
+                    raise
+                time.sleep(attempt + 1)
+
+        raise last_error or RuntimeError(f"Section LLM call failed for '{section_title}'")
+
+    def _is_local_lm_studio(self) -> bool:
+        base_url = str(getattr(self.llm, "base_url", "") or "").lower()
+        return ":1234" in base_url and ("127.0.0.1" in base_url or "localhost" in base_url)
+
+    def _is_empty_response_error(self, error: Exception) -> bool:
+        return "LLM返回空响应" in str(error)
+
+    def _is_timeout_error(self, error: Exception) -> bool:
+        lowered = str(error).lower()
+        return "request timed out" in lowered or "llm请求超时" in lowered or isinstance(error, TimeoutError)
+
+    def _should_finalize_from_observations(
+        self,
+        *,
+        tool_calls_count: int,
+        used_tools: set,
+        all_tools: set,
+        observation_snapshots: List[str],
+    ) -> bool:
+        if not observation_snapshots:
+            return False
+
+        if self._is_local_lm_studio():
+            enough_distinct_tools = len(used_tools) >= min(3, len(all_tools))
+            reached_tool_budget = tool_calls_count >= min(3, self.MAX_TOOL_CALLS_PER_SECTION)
+            return enough_distinct_tools or reached_tool_budget or used_tools == all_tools
+
+        return False
+
+    def _section_tool_availability_notice(self) -> str:
+        if self.interview_tool_available:
+            return ""
+
+        return (
+            "\n\n【工具可用性限制】\n"
+            "当前模拟环境未运行，禁止调用 interview_agents。\n"
+            "请仅使用 insight_forge、panorama_search、quick_search 完成章节分析。"
+        )
+
+    def _build_previous_sections_context(self, previous_sections: List[str]) -> str:
+        if not previous_sections:
+            return "（这是第一个章节）"
+
+        previous_parts = []
+        for section_content in previous_sections:
+            truncated = section_content[:4000] + "..." if len(section_content) > 4000 else section_content
+            previous_parts.append(truncated)
+        return "\n\n---\n\n".join(previous_parts)
+
+    def _truncate_tool_result_for_prompt(self, result: str) -> str:
+        if len(result) <= self.SECTION_OBSERVATION_MAX_CHARS:
+            return result
+
+        head_chars = int(self.SECTION_OBSERVATION_MAX_CHARS * 0.7)
+        tail_chars = self.SECTION_OBSERVATION_MAX_CHARS - head_chars
+        omitted_chars = len(result) - head_chars - tail_chars
+        head = result[:head_chars].rstrip()
+        tail = result[-tail_chars:].lstrip()
+        return (
+            f"{head}\n\n"
+            f"[... 省略 {omitted_chars} 个字符的中间内容，以控制上下文长度 ...]\n\n"
+            f"{tail}"
+        )
+
+    def _looks_like_partial_tool_call_response(self, response: str) -> bool:
+        stripped = response.strip()
+        if not stripped:
+            return False
+
+        if "<tool_call" in stripped and "</tool_call>" not in stripped:
+            return True
+
+        if stripped.startswith("<tool_call>") and not self._parse_tool_calls(stripped):
+            return True
+
+        if ('"name"' in stripped or '"tool"' in stripped) and ('"parameters"' in stripped or '"params"' in stripped):
+            return stripped.count("{") > stripped.count("}")
+
+        return False
+
+    def _extract_observation_quotes(self, observations: List[str]) -> List[str]:
+        primary_quotes: List[str] = []
+        historical_quotes: List[str] = []
+        seen = set()
+        patterns = [
+            re.compile(r'^\s*(?:\d+\.\s*)?"([^"\n]{30,320})"', re.MULTILINE),
+            re.compile(r'^\s*>\s*"([^"\n]{30,320})"', re.MULTILINE),
+            re.compile(r'摘要:\s*"([^"\n]{30,320})"'),
+        ]
+
+        for observation in observations:
+            for pattern in patterns:
+                for match in pattern.findall(observation):
+                    quote = re.sub(r'\s+', ' ', match).strip()
+                    if len(quote) < 30 or quote in seen:
+                        continue
+                    seen.add(quote)
+                    if quote.startswith('['):
+                        historical_quotes.append(quote)
+                    else:
+                        primary_quotes.append(quote)
+
+        return primary_quotes or historical_quotes
+
+    def _fallback_theme_definitions(self) -> List[Dict[str, Any]]:
+        return [
+            {
+                "id": "shock",
+                "keywords": [
+                    "shock", "crisis", "iran", "fuel", "rba", "inflation", "wholesale",
+                    "price volatility", "supply constraints", "geopolitical", "convergence"
+                ],
+                "labels": {
+                    "en": "Shock Transmission",
+                    "zh": "冲击传导",
+                },
+                "summaries": {
+                    "en": "The retrieved simulation evidence shows a layered shock moving through fuel costs, monetary conditions, and wholesale pricing at the same time.",
+                    "zh": "已检索到的模拟证据显示，冲击正在同时通过燃料成本、货币条件与批发电价向整个系统传导。",
+                },
+            },
+            {
+                "id": "policy",
+                "keywords": [
+                    "policy", "regulator", "regulation", "review", "rule", "rules", "qca",
+                    "aer", "aemc", "nerl", "ner", "dmo", "framework", "tariff"
+                ],
+                "labels": {
+                    "en": "Regulatory Adjustment",
+                    "zh": "监管与规则调整",
+                },
+                "summaries": {
+                    "en": "The retrieved evidence indicates that rule settings, price protections, and policy reviews are now shaping market behavior as directly as the original supply shock.",
+                    "zh": "已检索到的证据表明，规则设置、价格保护与政策审查，已经像最初的供给冲击一样直接影响市场行为。",
+                },
+            },
+            {
+                "id": "adoption",
+                "keywords": [
+                    "solar", "battery", "storage", "residential", "household", "vpp",
+                    "virtual power plant", "install rates", "attach rates", "distributed energy",
+                    "distributed", "decentralized", "adoption", "uptake"
+                ],
+                "labels": {
+                    "en": "Distributed Adoption",
+                    "zh": "分布式能源采用",
+                },
+                "summaries": {
+                    "en": "The simulation evidence suggests that households and installers are treating solar and battery systems as a direct hedge against price volatility and outage risk.",
+                    "zh": "模拟证据表明，家庭与安装商正在把光伏和储能系统视为对冲价格波动与停电风险的直接手段。",
+                },
+            },
+            {
+                "id": "operations",
+                "keywords": [
+                    "install", "installer", "support", "delay", "delayed", "backlog", "supply",
+                    "shortage", "delivery", "rescheduling", "warranty", "fuel shortage"
+                ],
+                "labels": {
+                    "en": "Installation And Supply Constraints",
+                    "zh": "安装与供应链约束",
+                },
+                "summaries": {
+                    "en": "The same dataset points to execution pressure: delivery bottlenecks, installer strain, and uneven after-sales support remain major friction points.",
+                    "zh": "同一批证据也揭示了执行层面的压力：交付瓶颈、安装商承压以及售后支持不均，仍然是主要摩擦点。",
+                },
+            },
+            {
+                "id": "grid",
+                "keywords": [
+                    "grid", "reliability", "stability", "export", "feed-in", "interconnector",
+                    "outage", "blackout", "resilience", "volatility"
+                ],
+                "labels": {
+                    "en": "Grid And System Resilience",
+                    "zh": "电网与系统韧性",
+                },
+                "summaries": {
+                    "en": "The retrieved observations show that value creation now depends on whether networks, export settings, and reliability mechanisms can absorb the faster pace of distributed uptake.",
+                    "zh": "已检索到的观察结果显示，后续价值能否兑现，取决于电网、出口限制与可靠性机制能否吸收更快的分布式采用节奏。",
+                },
+            },
+        ]
+
+    def _format_fallback_theme_list(self, labels: List[str], locale: str) -> str:
+        if not labels:
+            return ""
+        if len(labels) == 1:
+            return labels[0]
+        if locale == "zh":
+            if len(labels) == 2:
+                return f"{labels[0]}和{labels[1]}"
+            return f"{'、'.join(labels[:-1])}和{labels[-1]}"
+        if len(labels) == 2:
+            return f"{labels[0]} and {labels[1]}"
+        return f"{', '.join(labels[:-1])}, and {labels[-1]}"
+
+    def _pull_theme_quotes(
+        self,
+        *,
+        keywords: List[str],
+        quotes: List[str],
+        used_quotes: set,
+        limit: int,
+    ) -> List[str]:
+        selected = []
+        for quote in quotes:
+            if quote in used_quotes:
+                continue
+            quote_lower = quote.lower()
+            if any(keyword in quote_lower for keyword in keywords):
+                used_quotes.add(quote)
+                selected.append(quote)
+            if len(selected) >= limit:
+                break
+        return selected
+
+    def _build_section_from_observations(
+        self,
+        *,
+        section: ReportSection,
+        outline: ReportOutline,
+        observations: List[str],
+    ) -> str:
+        if not observations:
+            raise ValueError("No observations available for deterministic section synthesis")
+
+        locale = "en"
+        observation_text = "\n".join(observations).lower()
+        title_context = " ".join([
+            section.title,
+            outline.title,
+            getattr(self, "simulation_requirement", ""),
+        ]).lower()
+
+        theme_scores = []
+        for theme in self._fallback_theme_definitions():
+            score = sum(observation_text.count(keyword) for keyword in theme["keywords"])
+            score += sum(title_context.count(keyword) for keyword in theme["keywords"]) * 2
+            if score > 0:
+                theme_scores.append((score, theme))
+
+        theme_scores.sort(key=lambda item: item[0], reverse=True)
+        selected_themes = [theme for _, theme in theme_scores[:3]]
+        if not selected_themes:
+            selected_themes = self._fallback_theme_definitions()[:2]
+
+        quotes = self._extract_observation_quotes(observations)
+        used_quotes = set()
+
+        intro = "The retrieved simulation evidence points to three dominant dynamics: {themes}."
+        outro = "Taken together, these signals suggest that the next phase of the simulation will be driven less by a single trigger and more by how households, installers, networks, and regulators absorb these pressures simultaneously."
+        default_label = "Core Signal"
+        default_body = "The retrieved observations show that the change discussed in this section is not isolated; it is the product of multiple actors adjusting at the same time under the same pressure conditions."
+
+        parts = [
+            intro.format(
+                themes=self._format_fallback_theme_list(
+                    [theme["labels"].get(locale, theme["labels"]["en"]) for theme in selected_themes],
+                    locale,
+                )
+            )
+        ]
+
+        for theme in selected_themes:
+            label = theme["labels"].get(locale, theme["labels"]["en"])
+            summary = theme["summaries"].get(locale, theme["summaries"]["en"])
+            parts.append(f"**{label}**")
+            parts.append(summary)
+
+            theme_quotes = self._pull_theme_quotes(
+                keywords=theme["keywords"],
+                quotes=quotes,
+                used_quotes=used_quotes,
+                limit=2,
+            )
+
+            for quote in theme_quotes:
+                parts.append(f'> "{quote}"')
+
+        if not quotes:
+            parts.append(f"**{default_label}**")
+            parts.append(default_body)
+
+        parts.append(outro)
+
+        return "\n\n".join(part for part in parts if part)
+
+    def _synthesize_section_from_observations(
+        self,
+        *,
+        section: ReportSection,
+        outline: ReportOutline,
+        previous_sections: List[str],
+        observations: List[str],
+    ) -> str:
+        if not observations:
+            raise ValueError("No observations available for section synthesis")
+
+        observations_text = "\n\n".join(observations)
+
+        system_prompt = (
+            "You are a high-reliability simulation report writing assistant.\n"
+            "You are in section finalization mode: do not call tools, do not output <tool_call>, and do not output chain-of-thought.\n"
+            "You must output only the current section body.\n"
+            "Do not add any headings, do not repeat completed sections, and quote directly from retrieved evidence where possible.\n"
+            "Output must be English only. Do not use Chinese characters."
+        )
+        system_prompt = f"{system_prompt}\n\n{FORCED_REPORT_LANGUAGE_INSTRUCTION}"
+
+        user_prompt = (
+            f"Report title: {outline.title}\n"
+            f"Report summary: {outline.summary}\n"
+            f"Simulation requirement: {self.simulation_requirement}\n"
+            f"Current section: {section.title}\n\n"
+            f"Completed sections (avoid repetition):\n{self._build_previous_sections_context(previous_sections)}\n\n"
+            "Use only the retrieved simulation evidence below to write the section body:\n\n"
+            f"{observations_text}\n\n"
+            "Output the section body now."
+            " You may prefix with 'Final Answer:' if helpful, but do not include any <tool_call>, reasoning traces, or headings."
+            " Output must be English only."
+        )
+
+        try:
+            response = self._request_section_llm(
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                temperature=0.3,
+                section_title=section.title,
+                iteration_label="direct-synthesis",
+                max_tokens=1536,
+            )
+        except Exception as error:
+            logger.warning(
+                "Direct synthesis failed for '%s'; using deterministic observation fallback: %s",
+                section.title,
+                str(error),
+            )
+            return self._build_section_from_observations(
+                section=section,
+                outline=outline,
+                observations=observations,
+            )
+
+        final_answer = response.split("Final Answer:")[-1].strip() if "Final Answer:" in response else response.strip()
+        if final_answer and "<tool_call>" not in final_answer:
+            return final_answer
+
+        logger.warning(
+            "Direct synthesis for '%s' returned blank or invalid content; using deterministic observation fallback",
+            section.title,
+        )
+        return self._build_section_from_observations(
+            section=section,
+            outline=outline,
+            observations=observations,
+        )
+
+    def _generate_local_section_from_tools(
+        self,
+        *,
+        section: ReportSection,
+        outline: ReportOutline,
+        previous_sections: List[str],
+        progress_callback: Optional[Callable] = None,
+        section_index: int = 0,
+    ) -> str:
+        query_seed = f"{section.title} {self.simulation_requirement}".strip()
+        tool_plan = [
+            ("panorama_search", {"query": query_seed, "include_expired": True}),
+            ("quick_search", {"query": section.title, "limit": 8}),
+            ("quick_search", {"query": self.simulation_requirement, "limit": 8}),
+        ]
+
+        observations = []
+        for index, (tool_name, parameters) in enumerate(tool_plan, start=1):
+            if progress_callback:
+                progress_callback(
+                    "generating",
+                    min(90, int(index / len(tool_plan) * 100)),
+                    t('progress.deepSearchAndWrite', current=index, max=len(tool_plan)),
+                )
+
+            if self.report_logger:
+                self.report_logger.log_tool_call(
+                    section_title=section.title,
+                    section_index=section_index,
+                    tool_name=tool_name,
+                    parameters=parameters,
+                    iteration=index,
+                )
+
+            result = self._execute_tool(
+                tool_name,
+                parameters,
+                report_context=f"章节标题: {section.title}\n模拟需求: {self.simulation_requirement}",
+            )
+
+            if self.report_logger:
+                self.report_logger.log_tool_result(
+                    section_title=section.title,
+                    section_index=section_index,
+                    tool_name=tool_name,
+                    result=result,
+                    iteration=index,
+                )
+
+            observations.append(f"[{tool_name}]\n{self._truncate_tool_result_for_prompt(result)}")
+
+        final_answer = self._build_section_from_observations(
+            section=section,
+            outline=outline,
+            observations=observations,
+        )
+
+        if self.report_logger:
+            self.report_logger.log_section_content(
+                section_title=section.title,
+                section_index=section_index,
+                content=final_answer,
+                tool_calls_count=len(tool_plan),
+            )
+
+        return final_answer
     
     def _execute_tool(self, tool_name: str, parameters: Dict[str, Any], report_context: str = "") -> str:
         """
@@ -1007,6 +1532,11 @@ class ReportAgent:
             
             elif tool_name == "interview_agents":
                 # 深度采访 - 调用真实的OASIS采访API获取模拟Agent的回答（双平台）
+                if not self.interview_tool_available:
+                    return (
+                        "工具当前不可用: interview_agents 仅在模拟环境正在运行时可用。"
+                        "当前模拟环境未运行，请改用 insight_forge、panorama_search 或 quick_search 继续完成章节。"
+                    )
                 interview_topic = parameters.get("interview_topic", parameters.get("query", ""))
                 max_agents = parameters.get("max_agents", 5)
                 if isinstance(max_agents, str):
@@ -1061,9 +1591,6 @@ class ReportAgent:
             logger.error(t('report.toolExecFailed', toolName=tool_name, error=str(e)))
             return f"工具执行失败: {str(e)}"
     
-    # 合法的工具名称集合，用于裸 JSON 兜底解析时校验
-    VALID_TOOL_NAMES = {"insight_forge", "panorama_search", "quick_search", "interview_agents"}
-
     def _parse_tool_calls(self, response: str) -> List[Dict[str, Any]]:
         """
         从LLM响应中解析工具调用
@@ -1115,7 +1642,7 @@ class ReportAgent:
         """校验解析出的 JSON 是否是合法的工具调用"""
         # 支持 {"name": ..., "parameters": ...} 和 {"tool": ..., "params": ...} 两种键名
         tool_name = data.get("name") or data.get("tool")
-        if tool_name and tool_name in self.VALID_TOOL_NAMES:
+        if tool_name and tool_name in self.tools:
             # 统一键名为 name / parameters
             if "tool" in data:
                 data["name"] = data.pop("tool")
@@ -1133,6 +1660,17 @@ class ReportAgent:
             if params_desc:
                 desc_parts.append(f"  参数: {params_desc}")
         return "\n".join(desc_parts)
+
+    def _build_default_outline(self) -> ReportOutline:
+        return ReportOutline(
+            title="Simulation Analysis Report",
+            summary=self.simulation_requirement[:200],
+            sections=[
+                ReportSection(title="Market Environment and Key Drivers"),
+                ReportSection(title="Impact on Solar and Battery Business"),
+                ReportSection(title="Outlook and Risk Signals"),
+            ],
+        )
     
     def plan_outline(
         self, 
@@ -1163,7 +1701,7 @@ class ReportAgent:
         if progress_callback:
             progress_callback("planning", 30, t('progress.generatingOutline'))
         
-        system_prompt = f"{PLAN_SYSTEM_PROMPT}\n\n{get_language_instruction()}"
+        system_prompt = f"{PLAN_SYSTEM_PROMPT}\n\n{FORCED_REPORT_LANGUAGE_INSTRUCTION}"
         user_prompt = PLAN_USER_PROMPT_TEMPLATE.format(
             simulation_requirement=self.simulation_requirement,
             total_nodes=context.get('graph_statistics', {}).get('total_nodes', 0),
@@ -1173,14 +1711,26 @@ class ReportAgent:
             related_facts_json=json.dumps(context.get('related_facts', [])[:10], ensure_ascii=False, indent=2),
         )
 
+        if self._is_local_lm_studio():
+            logger.info("Using deterministic outline for local LM Studio run to avoid planning stalls")
+            return self._build_default_outline()
+
+        planning_timeout = self.llm.request_timeout
+
         try:
-            response = self.llm.chat_json(
+            response_content, _finish_reason = request_json_completion(
+                client=self.llm.client,
+                model=self.llm.model,
                 messages=[
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_prompt}
                 ],
-                temperature=0.3
+                temperature=0.3,
+                max_tokens=1200,
+                base_url=self.llm.base_url,
+                timeout=planning_timeout,
             )
+            response = parse_json_content(response_content)
             
             if progress_callback:
                 progress_callback("planning", 80, t('progress.parsingOutline'))
@@ -1194,7 +1744,7 @@ class ReportAgent:
                 ))
             
             outline = ReportOutline(
-                title=response.get("title", "模拟分析报告"),
+                title=response.get("title", "Simulation Analysis Report"),
                 summary=response.get("summary", ""),
                 sections=sections
             )
@@ -1208,15 +1758,7 @@ class ReportAgent:
         except Exception as e:
             logger.error(t('report.outlinePlanFailed', error=str(e)))
             # 返回默认大纲（3个章节，作为fallback）
-            return ReportOutline(
-                title="未来预测报告",
-                summary="基于模拟预测的未来趋势与风险分析",
-                sections=[
-                    ReportSection(title="预测场景与核心发现"),
-                    ReportSection(title="人群行为预测分析"),
-                    ReportSection(title="趋势展望与风险提示")
-                ]
-            )
+            return self._build_default_outline()
     
     def _generate_section_react(
         self, 
@@ -1259,18 +1801,13 @@ class ReportAgent:
             section_title=section.title,
             tools_description=self._get_tools_description(),
         )
-        system_prompt = f"{system_prompt}\n\n{get_language_instruction()}"
+        system_prompt = (
+            f"{system_prompt}"
+            f"{self._section_tool_availability_notice()}\n\n"
+            f"{FORCED_REPORT_LANGUAGE_INSTRUCTION}"
+        )
 
-        # 构建用户prompt - 每个已完成章节各传入最大4000字
-        if previous_sections:
-            previous_parts = []
-            for sec in previous_sections:
-                # 每个章节最多4000字
-                truncated = sec[:4000] + "..." if len(sec) > 4000 else sec
-                previous_parts.append(truncated)
-            previous_content = "\n\n---\n\n".join(previous_parts)
-        else:
-            previous_content = "（这是第一个章节）"
+        previous_content = self._build_previous_sections_context(previous_sections)
         
         user_prompt = SECTION_USER_PROMPT_TEMPLATE.format(
             previous_content=previous_content,
@@ -1281,14 +1818,25 @@ class ReportAgent:
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt}
         ]
+
+        if self._is_local_lm_studio():
+            return self._generate_local_section_from_tools(
+                section=section,
+                outline=outline,
+                previous_sections=previous_sections,
+                progress_callback=progress_callback,
+                section_index=section_index,
+            )
         
         # ReACT循环
         tool_calls_count = 0
-        max_iterations = 5  # 最大迭代轮数
-        min_tool_calls = 3  # 最少工具调用次数
+        max_iterations = 6 if self._is_local_lm_studio() else 5
+        min_tool_calls = 1 if self._is_local_lm_studio() else 3
         conflict_retries = 0  # 工具调用与Final Answer同时出现的连续冲突次数
         used_tools = set()  # 记录已调用过的工具名
-        all_tools = {"insight_forge", "panorama_search", "quick_search", "interview_agents"}
+        all_tools = set(self.tools.keys())
+        min_tool_calls = min(min_tool_calls, len(all_tools))
+        observation_snapshots = []
 
         # 报告上下文，用于InsightForge的子问题生成
         report_context = f"章节标题: {section.title}\n模拟需求: {self.simulation_requirement}"
@@ -1302,11 +1850,77 @@ class ReportAgent:
                 )
             
             # 调用LLM
-            response = self.llm.chat(
-                messages=messages,
-                temperature=0.5,
-                max_tokens=4096
-            )
+            try:
+                response = self._request_section_llm(
+                    messages=messages,
+                    temperature=0.5,
+                    section_title=section.title,
+                    iteration_label=f"iteration {iteration + 1}",
+                )
+            except Exception as error:
+                if (
+                    (self._is_empty_response_error(error) or self._is_timeout_error(error))
+                    and observation_snapshots
+                    and tool_calls_count >= min_tool_calls
+                ):
+                    logger.warning(
+                        "Section LLM failed for '%s' after %s tool calls; switching to direct synthesis: %s",
+                        section.title,
+                        tool_calls_count,
+                        str(error),
+                    )
+                    final_answer = self._synthesize_section_from_observations(
+                        section=section,
+                        outline=outline,
+                        previous_sections=previous_sections,
+                        observations=observation_snapshots,
+                    )
+                    if self.report_logger:
+                        self.report_logger.log_section_content(
+                            section_title=section.title,
+                            section_index=section_index,
+                            content=final_answer,
+                            tool_calls_count=tool_calls_count
+                        )
+                    return final_answer
+
+                if self._is_empty_response_error(error):
+                    logger.warning(
+                        "Empty section response for '%s' on iteration %s; requesting a clean retry",
+                        section.title,
+                        iteration + 1,
+                    )
+                    messages.append({"role": "assistant", "content": "（空响应）"})
+                    messages.append({
+                        "role": "user",
+                        "content": (
+                            "你刚才返回了空内容。请严格只输出以下两种合法格式之一：\n"
+                            "1. 一个完整闭合的 <tool_call> JSON 块；\n"
+                            "2. 以 'Final Answer:' 开头的章节正文。\n"
+                            "不要输出空白、半截 <tool_call> 标签、半截 JSON 或解释文字。"
+                        ),
+                    })
+                    continue
+
+                if self._is_timeout_error(error):
+                    logger.warning(
+                        "Section response timed out for '%s' on iteration %s; requesting a concise retry",
+                        section.title,
+                        iteration + 1,
+                    )
+                    messages.append({"role": "assistant", "content": "（请求超时）"})
+                    messages.append({
+                        "role": "user",
+                        "content": (
+                            "你刚才超时了。请更简洁地回复，并且只输出以下两种合法格式之一：\n"
+                            "1. 一个完整闭合的 <tool_call> JSON 块；\n"
+                            "2. 以 'Final Answer:' 开头的章节正文。\n"
+                            "不要输出思考过程、解释文字或多余内容。"
+                        ),
+                    })
+                    continue
+
+                raise
 
             # 检查 LLM 返回是否为 None（API 异常或内容为空）
             if response is None:
@@ -1325,6 +1939,24 @@ class ReportAgent:
             tool_calls = self._parse_tool_calls(response)
             has_tool_calls = bool(tool_calls)
             has_final_answer = "Final Answer:" in response
+
+            if not has_tool_calls and not has_final_answer and self._looks_like_partial_tool_call_response(response):
+                logger.warning(
+                    "Partial tool call detected for '%s' on iteration %s; requesting a valid retry",
+                    section.title,
+                    iteration + 1,
+                )
+                messages.append({"role": "assistant", "content": response})
+                messages.append({
+                    "role": "user",
+                    "content": (
+                        "你刚才的工具调用格式不完整。请重新回复，并且只做一件事：\n"
+                        "- 要么输出一个完整闭合的 <tool_call> JSON 块；\n"
+                        "- 要么直接以 'Final Answer:' 开头输出章节正文。\n"
+                        "不要输出半截标签、半截 JSON 或额外说明。"
+                    ),
+                })
+                continue
 
             # ── 冲突处理：LLM 同时输出了工具调用和 Final Answer ──
             if has_tool_calls and has_final_answer:
@@ -1446,6 +2078,8 @@ class ReportAgent:
 
                 tool_calls_count += 1
                 used_tools.add(call['name'])
+                prompt_result = self._truncate_tool_result_for_prompt(result)
+                observation_snapshots.append(f"[{call['name']}]\n{prompt_result}")
 
                 # 构建未使用工具提示
                 unused_tools = all_tools - used_tools
@@ -1458,13 +2092,40 @@ class ReportAgent:
                     "role": "user",
                     "content": REACT_OBSERVATION_TEMPLATE.format(
                         tool_name=call["name"],
-                        result=result,
+                        result=prompt_result,
                         tool_calls_count=tool_calls_count,
                         max_tool_calls=self.MAX_TOOL_CALLS_PER_SECTION,
                         used_tools_str=", ".join(used_tools),
                         unused_hint=unused_hint,
                     ),
                 })
+
+                if self._should_finalize_from_observations(
+                    tool_calls_count=tool_calls_count,
+                    used_tools=used_tools,
+                    all_tools=all_tools,
+                    observation_snapshots=observation_snapshots,
+                ):
+                    logger.info(
+                        "Collected sufficient observations for '%s' after %s tool calls; synthesizing section directly",
+                        section.title,
+                        tool_calls_count,
+                    )
+                    final_answer = self._synthesize_section_from_observations(
+                        section=section,
+                        outline=outline,
+                        previous_sections=previous_sections,
+                        observations=observation_snapshots,
+                    )
+                    if self.report_logger:
+                        self.report_logger.log_section_content(
+                            section_title=section.title,
+                            section_index=section_index,
+                            content=final_answer,
+                            tool_calls_count=tool_calls_count,
+                        )
+                    return final_answer
+
                 continue
 
             # ── 情况3：既没有工具调用，也没有 Final Answer ──
@@ -1501,13 +2162,38 @@ class ReportAgent:
         
         # 达到最大迭代次数，强制生成内容
         logger.warning(t('report.sectionMaxIter', title=section.title))
+
+        if observation_snapshots:
+            final_answer = self._synthesize_section_from_observations(
+                section=section,
+                outline=outline,
+                previous_sections=previous_sections,
+                observations=observation_snapshots,
+            )
+            if self.report_logger:
+                self.report_logger.log_section_content(
+                    section_title=section.title,
+                    section_index=section_index,
+                    content=final_answer,
+                    tool_calls_count=tool_calls_count
+                )
+            return final_answer
+
         messages.append({"role": "user", "content": REACT_FORCE_FINAL_MSG})
         
-        response = self.llm.chat(
-            messages=messages,
-            temperature=0.5,
-            max_tokens=4096
-        )
+        try:
+            response = self._request_section_llm(
+                messages=messages,
+                temperature=0.5,
+                section_title=section.title,
+                iteration_label="forced-final",
+            )
+        except Exception as error:
+            if self._is_empty_response_error(error):
+                logger.warning("Forced-final response for '%s' was empty", section.title)
+                response = ""
+            else:
+                raise
 
         # 检查强制收尾时 LLM 返回是否为 None
         if response is None:
@@ -1805,7 +2491,7 @@ class ReportAgent:
             report_content=report_content if report_content else "（暂无报告）",
             tools_description=self._get_tools_description(),
         )
-        system_prompt = f"{system_prompt}\n\n{get_language_instruction()}"
+        system_prompt = f"{system_prompt}\n\n{FORCED_REPORT_LANGUAGE_INSTRUCTION}"
 
         # 构建消息
         messages = [{"role": "system", "content": system_prompt}]
@@ -2499,23 +3185,8 @@ class ReportManager:
     @classmethod
     def get_report_by_simulation(cls, simulation_id: str) -> Optional[Report]:
         """根据模拟ID获取报告"""
-        cls._ensure_reports_dir()
-        
-        for item in os.listdir(cls.REPORTS_DIR):
-            item_path = os.path.join(cls.REPORTS_DIR, item)
-            # 新格式：文件夹
-            if os.path.isdir(item_path):
-                report = cls.get_report(item)
-                if report and report.simulation_id == simulation_id:
-                    return report
-            # 兼容旧格式：JSON文件
-            elif item.endswith('.json'):
-                report_id = item[:-5]
-                report = cls.get_report(report_id)
-                if report and report.simulation_id == simulation_id:
-                    return report
-        
-        return None
+        reports = cls.list_reports(simulation_id=simulation_id, limit=1)
+        return reports[0] if reports else None
     
     @classmethod
     def list_reports(cls, simulation_id: Optional[str] = None, limit: int = 50) -> List[Report]:

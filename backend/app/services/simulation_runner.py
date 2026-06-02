@@ -231,12 +231,13 @@ class SimulationRunner:
     def get_run_state(cls, simulation_id: str) -> Optional[SimulationRunState]:
         """获取运行状态"""
         if simulation_id in cls._run_states:
-            return cls._run_states[simulation_id]
+            return cls._reconcile_persisted_run_state(cls._run_states[simulation_id])
         
         # 尝试从文件加载
         state = cls._load_run_state(simulation_id)
         if state:
             cls._run_states[simulation_id] = state
+            return cls._reconcile_persisted_run_state(state)
         return state
     
     @classmethod
@@ -308,6 +309,97 @@ class SimulationRunner:
             json.dump(data, f, ensure_ascii=False, indent=2)
         
         cls._run_states[state.simulation_id] = state
+
+    @classmethod
+    def _get_simulation_log_tail(cls, simulation_id: str, max_chars: int = 4000) -> str:
+        """读取 simulation.log 末尾内容，用于恢复崩溃原因。"""
+        log_path = os.path.join(cls.RUN_STATE_DIR, simulation_id, "simulation.log")
+        if not os.path.exists(log_path):
+            return ""
+
+        try:
+            with open(log_path, 'r', encoding='utf-8', errors='replace') as f:
+                return f.read()[-max_chars:]
+        except Exception:
+            return ""
+
+    @classmethod
+    def _is_process_alive(cls, process_pid: Optional[int]) -> bool:
+        """检查持久化记录中的进程是否仍然存活。"""
+        if not process_pid:
+            return False
+
+        if IS_WINDOWS:
+            try:
+                result = subprocess.run(
+                    ["tasklist", "/FO", "CSV", "/NH", "/FI", f"PID eq {process_pid}"],
+                    capture_output=True,
+                    text=True,
+                    encoding='utf-8',
+                    errors='replace',
+                    check=False,
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                )
+                stdout = result.stdout or ""
+                return "INFO: No tasks are running" not in stdout and str(process_pid) in stdout
+            except Exception:
+                return False
+
+        try:
+            os.kill(process_pid, 0)
+            return True
+        except OSError:
+            return False
+
+    @classmethod
+    def _reconcile_persisted_run_state(
+        cls,
+        state: Optional[SimulationRunState],
+    ) -> Optional[SimulationRunState]:
+        """将落盘但已失活的运行状态修正为可恢复快照。"""
+        if not state:
+            return None
+
+        if state.runner_status not in [
+            RunnerStatus.STARTING,
+            RunnerStatus.RUNNING,
+            RunnerStatus.STOPPING,
+        ]:
+            return state
+
+        process = cls._processes.get(state.simulation_id)
+        if process and process.poll() is None:
+            return state
+
+        if cls._is_process_alive(state.process_pid):
+            return state
+
+        state.runner_status = RunnerStatus.STOPPED
+        state.twitter_running = False
+        state.reddit_running = False
+        state.completed_at = state.completed_at or datetime.now().isoformat()
+        state.updated_at = datetime.now().isoformat()
+
+        notes = ["Detected stale run state after the worker process exited."]
+        log_tail = cls._get_simulation_log_tail(state.simulation_id)
+        if "APITimeoutError" in log_tail or "ReadTimeout" in log_tail:
+            notes.append("Model requests timed out while the simulation was running.")
+        if "window-CLOSE event" in log_tail:
+            notes.append("The worker then terminated after a Windows console/window close event.")
+        elif log_tail:
+            notes.append("See simulation.log for the final stack trace.")
+
+        reconciliation_note = " ".join(notes)
+        if reconciliation_note not in (state.error or ""):
+            state.error = f"{state.error}\n{reconciliation_note}".strip() if state.error else reconciliation_note
+
+        cls._save_run_state(state)
+        logger.warning(
+            "检测到已失活的模拟进程，已修正运行状态: simulation=%s, pid=%s",
+            state.simulation_id,
+            state.process_pid,
+        )
+        return state
     
     @classmethod
     def start_simulation(
@@ -434,18 +526,25 @@ class SimulationRunner:
             env['PYTHONIOENCODING'] = 'utf-8'  # 确保 stdout/stderr 使用 UTF-8
             
             # 设置工作目录为模拟目录（数据库等文件会生成在此）
-            # 使用 start_new_session=True 创建新的进程组，确保可以通过 os.killpg 终止所有子进程
-            process = subprocess.Popen(
-                cmd,
-                cwd=sim_dir,
-                stdout=main_log_file,
-                stderr=subprocess.STDOUT,  # stderr 也写入同一个文件
-                text=True,
-                encoding='utf-8',  # 显式指定编码
-                bufsize=1,
-                env=env,  # 传递带有 UTF-8 设置的环境变量
-                start_new_session=True,  # 创建新进程组，确保服务器关闭时能终止所有相关进程
-            )
+            popen_kwargs = {
+                "cwd": sim_dir,
+                "stdout": main_log_file,
+                "stderr": subprocess.STDOUT,
+                "text": True,
+                "encoding": 'utf-8',
+                "bufsize": 1,
+                "env": env,
+            }
+            if IS_WINDOWS:
+                # Windows 下让子进程脱离当前控制台，避免终端断开或窗口关闭时直接带崩模拟进程。
+                popen_kwargs["creationflags"] = (
+                    getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+                    | getattr(subprocess, "DETACHED_PROCESS", 0)
+                )
+            else:
+                popen_kwargs["start_new_session"] = True
+
+            process = subprocess.Popen(cmd, **popen_kwargs)
             
             # 保存文件句柄以便后续关闭
             cls._stdout_files[simulation_id] = main_log_file
